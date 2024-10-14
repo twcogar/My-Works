@@ -1,0 +1,466 @@
+function createCSVfromCurrentMonthFiles(isManualRun = false) {
+  var lock = LockService.getScriptLock();
+  
+  // Initialize the response object
+  var response = {
+    success: true,
+    message: '',
+    downloadUrl: '',
+    fileName: ''
+  };
+
+  // Early check if CSVs have already been generated to prevent duplicate runs
+  var currentDate = new Date();
+  var nextBusinessDate = calculateNextBusinessDay(currentDate);
+  var formattedNextBusinessDate = Utilities.formatDate(nextBusinessDate, Session.getScriptTimeZone(), 'MM-dd-yyyy');
+  var formattedNextBusinessDateForEmail = Utilities.formatDate(nextBusinessDate, Session.getScriptTimeZone(), 'MM/dd/yyyy');
+
+  // File naming logic
+  var deliveriesFileName = 'Deliveries for ' + formattedNextBusinessDate + ' To Arey Jones from WCPSS.csv';
+  var pickUpsFileName = 'Pick Ups for ' + formattedNextBusinessDate + ' To Arey Jones.csv';
+
+  // Check if the CSV files already exist
+  if (!isManualRun && checkIfCSVAlreadyGenerated(deliveriesFileName, pickUpsFileName)) {
+    Logger.log('CSV files for the next business day have already been generated. Exiting.');
+    response.message = 'CSV files for the next business day have already been generated.';
+    response.success = false;
+    return response;
+  }
+
+  if (!isManualRun) {
+    try {
+      lock.waitLock(30000); // Wait for up to 30 seconds for the lock
+    } catch (e) {
+      Logger.log('Could not obtain lock. Another instance of the script is running.');
+      response.message = 'Could not obtain lock. Another instance of the script is running.';
+      response.success = false;
+      return response;
+    }
+
+    var properties = PropertiesService.getScriptProperties();
+    var runDateKey = 'lastRunDate';
+    var lastRunDate = properties.getProperty(runDateKey);
+
+    // Format current date as YYYY-MM-DD to compare
+    var formattedCurrentDate = Utilities.formatDate(currentDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+    // Check if the script has already run today (only for automated runs)
+    if (lastRunDate === formattedCurrentDate) {
+      Logger.log('Script has already run today. Exiting.');
+      response.message = 'Script has already run today.';
+      response.success = false;
+      lock.releaseLock();
+      return response;
+    }
+
+    // Update the last run date
+    properties.setProperty(runDateKey, formattedCurrentDate);
+
+    // Check if today is a workday (only for automated runs)
+    if (!isWorkDay(currentDate)) {
+      Logger.log('Today is not a workday. The script will not run.');
+      response.message = 'Today is not a workday.';
+      response.success = false;
+      lock.releaseLock();
+      return response;
+    }
+  }
+
+  var sourceFolderId = '13Pq_f2B_WcNuUJ8xqXAzoKjqWkgiKaWl';
+  var destinationRootFolderId = '1wFyMY_6QjakTjuDBrvqMtdGb_zHURoEx';
+  var sourceFolder = DriveApp.getFolderById(sourceFolderId);
+  var destinationRootFolder = DriveApp.getFolderById(destinationRootFolderId);
+
+  // Determine the current year and month folders
+  var yearFolderName = getYearFolderName(new Date());
+  var yearFolder = findOrCreateFolder(destinationRootFolder, yearFolderName);
+
+  var monthFolderName = getCurrentMonthFolderName(new Date());
+  var monthFolder = findOrCreateFolder(yearFolder, monthFolderName);
+
+  // Proceed with file generation and saving logic...
+  var formattedTodayDate = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MM/dd/yyyy');
+  var currentMonthFolder = findFolderByName(sourceFolder, getCurrentMonthFolderName(new Date()));
+
+  if (!currentMonthFolder) {
+    Logger.log('Current month source folder not found');
+    if (!isManualRun) {
+      lock.releaseLock();
+    }
+    response.message = 'Current month source folder not found.';
+    response.success = false;
+    return response;
+  }
+
+  var files = currentMonthFolder.getFiles();
+  var deliveriesCsvContent = [];
+  var pickUpsCsvContent = [];
+  var deliveriesHeaderAdded = false;
+  var pickUpsHeaderAdded = false;
+
+  // Updated file naming pattern (without AM/PM, retaining Carry Over)
+  var todayFileNamePattern = new RegExp('\\[TFC\\] - \\[' + formattedTodayDate + '\\] - Daily Fulfillment Requests');
+  var carryOverFileNamePattern = new RegExp('\\[TFC\\] - \\[.*\\] - Daily Fulfillment Requests Carry Over \\[' + formattedTodayDate + '\\]');
+
+  while (files.hasNext()) {
+    var file = files.next();
+    var fileName = file.getName();
+    Logger.log('Checking file: ' + fileName);
+
+    if (todayFileNamePattern.test(fileName) || carryOverFileNamePattern.test(fileName)) {
+      Logger.log('File matched: ' + fileName);
+      var fileId = file.getId();
+      var spreadsheet = SpreadsheetApp.openById(fileId);
+      var sheets = spreadsheet.getSheets();
+      sheets.forEach(sheet => {
+        var sheetName = sheet.getName();
+        Logger.log('Processing sheet: ' + sheetName);
+        if (sheetName === 'Deliveries To Arey Jones' || sheetName === 'Bulk Deliveries To Arey Jones' || sheetName === 'Pick Ups To Arey Jones') {
+          var data = sheet.getDataRange().getValues();
+          Logger.log('Data length for ' + sheetName + ': ' + data.length);
+          if (data.length > 0) {
+            if ((sheetName === 'Deliveries To Arey Jones' || sheetName === 'Bulk Deliveries To Arey Jones') && !deliveriesHeaderAdded) {
+              deliveriesCsvContent.push(data[0]); // Add header once
+              deliveriesHeaderAdded = true;
+            } else if (sheetName === 'Pick Ups To Arey Jones' && !pickUpsHeaderAdded) {
+              pickUpsCsvContent.push(data[0]); // Add header once
+              pickUpsHeaderAdded = true;
+            }
+            data.slice(1).forEach(row => {
+              if (row.some(cell => cell !== "")) { // Only add rows that have non-empty cells
+                // Process Column S (index 18) for specific formatting
+                if (row.length > 18 && row[18] !== "") {
+                  // Remove prefixes 5000000 or 50000000 from Column S
+                  if (typeof row[18] === "string") {
+                    if (row[18].startsWith("5000000")) {
+                      row[18] = row[18].substring(7); // Remove the "5000000" prefix
+                    } else if (row[18].startsWith("50000000")) {
+                      row[18] = row[18].substring(8); // Remove the "50000000" prefix
+                    }
+                  }
+                }
+                var rowData = row.map(cell => {
+                  if (typeof cell === "string") {
+                    return '"' + cell.replace(/"/g, '""') + '"';
+                  }
+                  return cell;
+                });
+                if (sheetName === 'Deliveries To Arey Jones' || sheetName === 'Bulk Deliveries To Arey Jones') {
+                  deliveriesCsvContent.push(rowData);
+                } else if (sheetName === 'Pick Ups To Arey Jones') {
+                  pickUpsCsvContent.push(rowData);
+                }
+              }
+            });
+          }
+        }
+      });
+    } else {
+      Logger.log('File did not match: ' + fileName);
+    }
+  }
+
+  // **New feature: Count unique 'Ship to Name' and total deliveries**
+  var uniqueShipToNames = new Set();
+  var totalDeliveries = 0;
+
+  deliveriesCsvContent.slice(1).forEach(row => { // Skip the header row
+    var shipToName = row[6]; // Column G is at index 6
+    if (shipToName && shipToName.trim() !== '') {
+      uniqueShipToNames.add(shipToName.trim());
+      totalDeliveries++;
+    }
+  });
+
+  // Sort the CSV data by column G (index 6) from row 2 downwards
+  if (deliveriesCsvContent.length > 1) {
+    var headers = deliveriesCsvContent[0]; // Keep headers
+    var dataRows = deliveriesCsvContent.slice(1);
+
+    dataRows.sort((a, b) => {
+      return a[6].localeCompare(b[6]);
+    });
+
+    deliveriesCsvContent = [headers].concat(dataRows);
+
+    deliveriesCsvContent = deliveriesCsvContent.map(row => {
+      if (Array.isArray(row)) {
+        return row.join(",");
+      }
+      return row;
+    });
+
+    // Remove previous file if it exists
+    deleteExistingFile(monthFolder, deliveriesFileName);
+
+    var deliveriesCsvBlob = Utilities.newBlob(deliveriesCsvContent.join("\n"), 'text/csv', deliveriesFileName);
+    var deliveriesFile = monthFolder.createFile(deliveriesCsvBlob);
+
+    Logger.log('Deliveries CSV file created and saved successfully');
+
+    // Updated email content with new feature
+    var emailBody = 'Please find the attached .csv file for all deliveries confirmed for ' + formattedNextBusinessDateForEmail;
+    emailBody += '\n\nThe total amount of locations is: ' + uniqueShipToNames.size; 
+    emailBody += '\nThe total amount of deliveries is: ' + totalDeliveries;
+    emailBody += '\n\nThanks,'; 
+
+    sendEmailWithAttachment(
+      'scheduling@areyjones.com', 
+      'Deliveries for ' + formattedNextBusinessDate + ' To Vendor from Your Organization', 
+      emailBody, 
+      deliveriesCsvBlob, 
+      deliveriesFileName
+    );
+
+    response.downloadUrl = deliveriesFile.getDownloadUrl();
+    response.fileName = deliveriesFileName;
+  } else {
+    Logger.log('No deliveries files found with today\'s date.');
+    response.message = 'No deliveries files found with today\'s date.';
+    response.success = false;
+  }
+
+  // **Process and send Pick Ups CSV**
+  if (pickUpsCsvContent.length > 1) { // Check if there are rows beyond the header
+    var headers = pickUpsCsvContent[0]; // Keep headers
+    var dataRows = pickUpsCsvContent.slice(1);
+
+    dataRows.sort((a, b) => {
+      return a[6].localeCompare(b[6]);
+    });
+
+    pickUpsCsvContent = [headers].concat(dataRows);
+
+    pickUpsCsvContent = pickUpsCsvContent.map(row => {
+      if (Array.isArray(row)) {
+        return row.join(",");
+      }
+      return row;
+    });
+
+    deleteExistingFile(monthFolder, pickUpsFileName);
+
+    var pickUpsCsvBlob = Utilities.newBlob(pickUpsCsvContent.join("\n"), 'text/csv', pickUpsFileName);
+    var pickUpsFile = monthFolder.createFile(pickUpsCsvBlob);
+
+    Logger.log('Pick Ups CSV file created and saved successfully');
+
+    // Prepare and send the pick ups email
+    var pickUpEmailBody = 'Please find the attached .csv file for all pickups confirmed for ' + formattedNextBusinessDateForEmail;
+    pickUpEmailBody += '\n\nThanks,';
+
+    sendEmailWithAttachment(
+      'scheduling@areyjones.com',
+      'Pick Ups for ' + formattedNextBusinessDate + ' To Vendor from Your Organization',
+      pickUpEmailBody,
+      pickUpsCsvBlob,
+      pickUpsFileName
+    );
+
+    if (!response.downloadUrl) { // If there is no deliveries file, use the pick ups file for download
+      response.downloadUrl = pickUpsFile.getDownloadUrl();
+      response.fileName = pickUpsFileName;
+    }
+  } else {
+    Logger.log('No pick ups files found with today\'s date.');
+    if (!response.downloadUrl) { // If there is no deliveries file, update the response message
+      response.message = 'No pick ups files found with today\'s date.';
+      response.success = false;
+    }
+  }
+
+  if (!isManualRun) {
+    lock.releaseLock();
+  }
+
+  return response;
+}
+
+// Function to manually trigger the CSV creation without time constraints
+function manualRunCSV() {
+  createCSVfromCurrentMonthFiles(true); // Passing "true" indicates manual execution
+}
+
+// Function to schedule the automatic 3 PM run considering DST
+function schedule3pmRun() {
+  deleteAllTriggers(); // First, delete existing triggers to avoid duplicates
+
+  // Get today's date
+  var today = new Date();
+
+  // Get the 3PM time for today, considering DST
+  var runTime = get3pmWithDST(today);
+
+  // Schedule the script to run at 3PM EST/EDT
+  ScriptApp.newTrigger('createCSVfromCurrentMonthFiles')
+    .timeBased()
+    .at(runTime)
+    .create();
+}
+
+function get3pmWithDST(today) {
+  var year = today.getFullYear();
+  var march = new Date(year, 2, 1); // March 1st
+  var november = new Date(year, 10, 1); // November 1st
+
+  var secondSundayInMarch = new Date(march.setDate(8 - march.getDay() + 1)); // Second Sunday in March
+  var firstSundayInNovember = new Date(november.setDate(7 - november.getDay() + 1)); // First Sunday in November
+
+  var isDST = today >= secondSundayInMarch && today < firstSundayInNovember;
+
+  var timeZoneOffset = isDST ? -4 : -5; // EST is UTC-5, EDT is UTC-4
+
+  // Create the 3PM date object
+  var runTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 15, 0, 0);
+
+  // Adjust to 3PM EST/EDT by adding the time zone offset
+  runTime.setUTCHours(runTime.getUTCHours() - timeZoneOffset);
+
+  return runTime;
+}
+
+// Function to delete all triggers
+function deleteAllTriggers() {
+  var allTriggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < allTriggers.length; i++) {
+    ScriptApp.deleteTrigger(allTriggers[i]);
+  }
+}
+
+// Additional functions related to workdays, folder management, etc.
+function findOrCreateFolder(parentFolder, folderName) {
+  var folder = findFolderByName(parentFolder, folderName);
+  if (!folder) {
+    folder = parentFolder.createFolder(folderName);
+    Logger.log('Folder created: ' + folderName);
+  }
+  return folder;
+}
+
+function deleteExistingFile(folder, fileName) {
+  var files = folder.getFilesByName(fileName);
+  while (files.hasNext()) {
+    var file = files.next();
+    file.setTrashed(true);
+    Logger.log('Deleted existing file: ' + fileName);
+  }
+}
+
+function checkIfCSVAlreadyGenerated(deliveriesFileName, pickUpsFileName) {
+  var destinationRootFolderId = '1wFyMY_6QjakTjuDBrvqMtdGb_zHURoEx';
+  var destinationRootFolder = DriveApp.getFolderById(destinationRootFolderId);
+
+  var yearFolder = findOrCreateFolder(destinationRootFolder, getYearFolderName(new Date()));
+  var currentMonthFolder = findOrCreateFolder(yearFolder, getCurrentMonthFolderName(new Date()));
+  
+  if (!currentMonthFolder) {
+    Logger.log('Current month destination folder not found');
+    return false; // Proceed as the folder doesn't exist
+  }
+
+  var deliveriesFileExists = fileExists(currentMonthFolder, deliveriesFileName);
+  var pickUpsFileExists = fileExists(currentMonthFolder, pickUpsFileName);
+
+  return deliveriesFileExists && pickUpsFileExists;
+}
+
+function isWorkDay(date) {
+  var day = date.getDay();
+  if (day === 0 || day === 6) { // 0 = Sunday, 6 = Saturday
+    return false;
+  }
+
+  var formattedDate = Utilities.formatDate(date, Session.getScriptTimeZone(), 'MM-dd-yyyy');
+  var holidays = getFederalHolidays(date.getFullYear());
+  if (holidays.includes(formattedDate)) {
+    return false;
+  }
+
+  return true;
+}
+
+function calculateNextBusinessDay(date) {
+  var nextDate = new Date(date);
+  var holidays = getFederalHolidays(nextDate.getFullYear());
+  
+  do {
+    nextDate.setDate(nextDate.getDate() + 1);
+  } while (nextDate.getDay() == 6 || nextDate.getDay() == 0 || holidays.includes(Utilities.formatDate(nextDate, Session.getScriptTimeZone(), 'MM-dd-yyyy')));
+  
+  return nextDate;
+}
+
+function getFederalHolidays(year) {
+  var holidays = [
+    '01-01-' + year, 
+    '07-04-' + year, 
+    '11-11-' + year, 
+    '12-25-' + year, 
+    '12-26-' + year 
+  ];
+  
+  var mlkDay = new Date(year, 0, 1);
+  mlkDay.setDate(15 + (1 - mlkDay.getDay() + 7) % 7);
+  holidays.push(Utilities.formatDate(mlkDay, Session.getScriptTimeZone(), 'MM-dd-yyyy'));
+
+  var washingtonBirthday = new Date(year, 1, 1);
+  washingtonBirthday.setDate(15 + (1 - washingtonBirthday.getDay() + 7) % 7);
+  holidays.push(Utilities.formatDate(washingtonBirthday, Session.getScriptTimeZone(), 'MM-dd-yyyy'));
+
+  var memorialDay = new Date(year, 4, 31);
+  memorialDay.setDate(memorialDay.getDate() - (memorialDay.getDay() + 1) % 7);
+  holidays.push(Utilities.formatDate(memorialDay, Session.getScriptTimeZone(), 'MM-dd-yyyy'));
+
+  var laborDay = new Date(year, 8, 1);
+  laborDay.setDate(1 + (1 - laborDay.getDay() + 7) % 7);
+  holidays.push(Utilities.formatDate(laborDay, Session.getScriptTimeZone(), 'MM-dd-yyyy'));
+
+  var thanksgivingDay = new Date(year, 10, 1);
+  thanksgivingDay.setDate(22 + (4 - thanksgivingDay.getDay() + 7) % 7);
+  holidays.push(Utilities.formatDate(thanksgivingDay, Session.getScriptTimeZone(), 'MM-dd-yyyy'));
+
+  holidays.push('11-27-' + year, '11-28-' + year, '11-29-' + year); // Custom Thanksgiving Break
+
+  return holidays;
+}
+
+function findFolderByName(parentFolder, folderName) {
+  var folders = parentFolder.getFoldersByName(folderName);
+  return folders.hasNext() ? folders.next() : null;
+}
+
+function fileExists(folder, fileName) {
+  var files = folder.getFilesByName(fileName);
+  return files.hasNext();
+}
+
+function getYearFolderName(date) {
+  var year = date.getFullYear();
+  var month = date.getMonth() + 1; 
+  var nextYear = year + 1;
+
+  if (month >= 7) { 
+    return (year % 100) + "'-" + (nextYear % 100) + "'"; 
+  } else { 
+    return (year - 1) % 100 + "'-" + (year % 100) + "'"; 
+  }
+}
+
+function getCurrentMonthFolderName(date) {
+  var monthSequence = ['01-July', '02-August', '03-September', '04-October', '05-November', '06-December', '07-January', '08-February', '09-March', '10-April', '11-May', '12-June'];
+  
+  var currentMonth = date.getMonth(); 
+  var sequenceMonthIndex = (currentMonth >= 6) ? currentMonth - 6 : currentMonth + 6;
+  
+  return monthSequence[sequenceMonthIndex];
+}
+
+function sendEmailWithAttachment(recipient, subject, body, attachment, fileName) {
+  MailApp.sendEmail({
+    to: 'email@email.com',
+    cc: '',
+    subject: subject,
+    body: body,
+    attachments: [attachment.setName(fileName)]
+  });
+}
